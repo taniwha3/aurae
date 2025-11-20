@@ -215,6 +215,14 @@ fn in_new_cgroup_namespace() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::init::system_runtimes::SystemRuntime;
+    use anyhow::anyhow;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tonic::async_trait;
+    use tokio::runtime::Runtime;
 
     fn pid_one() -> u32 {
         1
@@ -275,5 +283,73 @@ mod tests {
             ),
             Context::Cell
         );
+    }
+
+    #[derive(Clone)]
+    struct MockRuntime {
+        calls: Arc<AtomicUsize>,
+        label: &'static str,
+    }
+
+    impl MockRuntime {
+        fn new(label: &'static str) -> Self {
+            Self { calls: Arc::new(AtomicUsize::new(0)), label }
+        }
+    }
+
+    #[async_trait]
+    impl SystemRuntime for Arc<MockRuntime> {
+        async fn init(
+            self,
+            _verbose: bool,
+            _socket_address: Option<String>,
+        ) -> Result<SocketStream, SystemRuntimeError> {
+            let _ = self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(SystemRuntimeError::Other(anyhow!(self.label)))
+        }
+    }
+
+    fn assert_called_once(mock: &Arc<MockRuntime>) {
+        assert_eq!(
+            mock.calls.load(Ordering::SeqCst),
+            1,
+            "expected {} to be called once",
+            mock.label
+        );
+    }
+
+    #[test]
+    fn init_should_call_matching_system_runtime() {
+        let rt = Runtime::new().expect("tokio runtime");
+
+        let pid1 = Arc::new(MockRuntime::new("pid1"));
+        let cell = Arc::new(MockRuntime::new("cell"));
+        let container = Arc::new(MockRuntime::new("container"));
+        let daemon = Arc::new(MockRuntime::new("daemon"));
+
+        rt.block_on(async {
+            let runtimes = [
+                (Context::Pid1, pid1.clone()),
+                (Context::Cell, cell.clone()),
+                (Context::Container, container.clone()),
+                (Context::Daemon, daemon.clone()),
+            ];
+
+            for (context, runtime) in runtimes {
+                let _ = match context {
+                    Context::Pid1 => runtime.clone().init(false, None).await,
+                    Context::Cell => runtime.clone().init(false, None).await,
+                    Context::Container => {
+                        runtime.clone().init(false, None).await
+                    }
+                    Context::Daemon => runtime.clone().init(false, None).await,
+                };
+            }
+        });
+
+        assert_called_once(&pid1);
+        assert_called_once(&cell);
+        assert_called_once(&container);
+        assert_called_once(&daemon);
     }
 }
